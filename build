@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+
+if [[ "$0" != "${BASH_SOURCE[0]}" ]]; then
+  echo "${BASH_SOURCE[0]}: this script should be executed, not sourced."
+  return 10
+fi
+
+set -Eeuo pipefail
+# set -x
+
+# The 'build' default here is just for easy copy-paste in interactive development
+BASEDIR=$(dirname "$(realpath "${BASH_SOURCE[0]:-build}")")
+PREFIX="$BASEDIR/target"
+SYSROOT="$PREFIX/sysroot"
+WORK="$BASEDIR/work"
+TARGET=sparc-sun-solaris2.6
+FORCE_DOWNLOAD=n
+
+# Source download URLs
+GMP_URL='https://gmplib.org/download/gmp/gmp-6.1.2.tar.xz'
+MPFR_URL='https://gitlab.inria.fr/mpfr/mpfr.git'
+MPFR_TAG='3.1.4'
+BINUTILS_URL='https://sourceware.org/pub/binutils/snapshots/binutils-2.40.90.tar.xz'
+GCC_URL='git://gcc.gnu.org/git/gcc.git'
+GCC_TAG='releases/gcc-4.3.6'
+
+# SSH config for a running Solaris Sparc system - defaults are for a suitably set-up Qemu
+SPARC_SSH_USER=$(id -un)
+SPARC_SSH_HOST=localhost
+SPARC_SSH_PORT=2222
+
+mkdir -p "$PREFIX" "$WORK/src" "$WORK/build" "$SYSROOT"
+
+# Make a local copy of include & lib files from a Solaris Sparc system, via rsync/ssh
+# The --include for 'lib', 'include' and 'X' are for directory symlinks
+rsync  -rltmvH --relative --executability \
+    -e "ssh -l $SPARC_SSH_USER -p $SPARC_SSH_PORT" \
+    --include='*/' \
+    --include='*.[aho]' \
+    --include='*.so*' \
+    --include='lib' \
+    --include='include' \
+    --include='X' \
+    --exclude='*' \
+    $SPARC_SSH_HOST:/usr/include \
+    $SPARC_SSH_HOST:/usr/lib \
+    $SPARC_SSH_HOST:/usr/share/lib \
+    $SPARC_SSH_HOST:/usr/openwin/share/include \
+    $SPARC_SSH_HOST:/usr/openwin/include \
+    $SPARC_SSH_HOST:/usr/openwin/lib \
+    $SPARC_SSH_HOST:/usr/dt/share/include \
+    $SPARC_SSH_HOST:/usr/dt/include \
+    $SPARC_SSH_HOST:/usr/dt/lib \
+    $SPARC_SSH_HOST:/usr/X \
+    $SPARC_SSH_HOST:/usr/ccs/lib \
+    $SPARC_SSH_HOST:/lib \
+    "$SYSROOT/"
+
+# Some symlinks on the Solaris filesystem are absolute, but actually point inside the copied tree.
+# Make these broken symlinks have relative targets in the local $SYSROOT.
+# '-xtype l' gives only the broken symlinks
+find "$SYSROOT" -xtype l -exec sh -c '
+  link="$1"; sysroot="$2"; target="$(readlink "$link")";
+  ln -sf "$sysroot$target" "$link"
+' 'sh' {} "$SYSROOT" \;
+
+# The GCC build needs values-Xa.o but it can't find it under /usr/ccs/lib
+[ -L "$SYSROOT/usr/lib/values-Xa.o" ] || ln -sr "$SYSROOT/usr/ccs/lib/values-Xa.o" "$SYSROOT/usr/lib/"
+
+# -- Download GMP Source if necessary --
+mkdir -p "$WORK/src/gmp" && cd "$_"
+if [ ! -f README ] || [ "$FORCE_DOWNLOAD" = y ]; then
+    curl --fail --show-error --no-progress-meter "$GMP_URL" | tar -x --xz --strip-components=1
+fi
+
+# --- Download MPFR Source if necessary ---
+mkdir -p "$WORK/src/mpfr" && cd "$_"
+if [ ! -d ".git" ]; then
+    # 'git clone --branch' works with tags too
+    git clone --branch "$MPFR_TAG" --depth 1 "$MPFR_URL" .
+elif [ "$FORCE_DOWNLOAD" = y ]; then
+    git stash -u
+    git reset --hard "$MPFR_TAG"
+    git pull -f
+fi
+./autogen.sh
+
+# --- Download Binutils Source if necessary ---
+mkdir -p "$WORK/src/binutils" && cd "$_"
+if [ ! -f README ] || [ "$FORCE_DOWNLOAD" = y ]; then
+    curl --fail --show-error --no-progress-meter "$BINUTILS_URL" | tar -x --xz --strip-components=1
+fi
+
+# --- Download GCC Source if necessary ---
+mkdir -p "$WORK/src/gcc" && cd "$_"
+if [ ! -d ".git" ]; then
+    git clone --branch "$GCC_TAG" --depth 1 "$GCC_URL" .
+elif [ "$FORCE_DOWNLOAD" = y ]; then
+    git stash -u
+    git reset --hard "$GCC_TAG"
+    git pull -f
+fi
+cd "$WORK/src/gcc"
+# Apply a Texinfo patch to accommodate newer versions
+# One example of many: https://www.mail-archive.com/gcc-patches@gcc.gnu.org/msg62557.html
+git 2>/dev/null apply --reverse --check "$BASEDIR/gcc-4.3.6.patch" || git apply "$BASEDIR/gcc-4.3.6.patch"
+
+unset LD_LIBRARY_PATH
+export LD_LIBRARY_PATH
+
+# --- GMP ---
+mkdir -p "$WORK/build/gmp" && cd "$_"
+"$WORK/src/gmp/configure" --prefix="$PREFIX"
+make
+make check
+make install
+
+# --- MPFR ---
+mkdir -p "$WORK/build/mpfr" && cd "$_"
+"$WORK/src/mpfr/configure" --with-gmp="$PREFIX" --prefix="$PREFIX"
+make
+make check
+make install
+
+# --- Binutils ---
+mkdir -p "$WORK/build/binutils" && cd "$_"
+"$WORK/src/binutils/configure" --target=$TARGET --prefix="$PREFIX" --with-sysroot="$SYSROOT" --with-gmp="$PREFIX" --with-mpfr="$PREFIX"
+make
+make check
+make install
+
+# --- GCC ---
+mkdir -p "$WORK/build/gcc" && cd "$_"
+# Force old GNU inline behaviour in recent compilers: https://bugzilla.redhat.com/show_bug.cgi?id=476370
+CFLAGS="-g -O2 -fgnu89-inline" "$WORK/src/gcc/configure" --target=$TARGET --prefix="$PREFIX" --with-sysroot="$SYSROOT" \
+  --with-gmp="$PREFIX" --with-mpfr="$PREFIX" \
+  --with-gnu-as --with-gnu-ld --enable-languages=c,c++ --enable-obsolete --enable-static
+# Bake the library path for libmpfr.so & libgmp.so into e.g. cc1's RUNPATH
+LD_RUN_PATH="$PREFIX/lib" make
+make install
+set +x
+echo 'Success!'
